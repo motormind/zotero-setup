@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zotero-setup"
+version = "0.1.0"
+description = "Push papers from a research repo into a Zotero (group) library and pull references back - stdlib only."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+zt = "zotero_setup.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+zotero_setup = ["templates/*", "templates/.*"]

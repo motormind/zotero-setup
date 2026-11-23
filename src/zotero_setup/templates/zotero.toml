@@ -1,0 +1,17 @@
+# Zotero settings for this project. This file is committed -> NO secrets here!
+# The API key comes from the environment or from .env (ZOTERO_API_KEY).
+
+library_type = "group"         # "group" or "user"
+library_id   = "000000"        # group ID from the URL zotero.org/groups/<ID>/...
+collection   = ""              # collection key (8 chars, see `zt collections`); empty = whole library
+tags         = []              # tags added to new items, e.g. ["src:my-project"]
+
+[pull]
+output = "references.bib"      # target file of `zt pull`
+format = "biblatex"            # biblatex | bibtex | csljson | ris
+
+[push]
+ids_files   = ["papers/ids.txt"]   # files with DOIs / arXiv IDs / URLs, one per line
+bib_files   = []                   # e.g. ["papers/*.bib"] - entries are added to Zotero
+pdf_dirs    = ["papers"]           # <citekey>.pdf / <doi>.pdf / <arxiv-id>.pdf get attached
+upload_pdfs = false                # true = upload PDFs (uses the group's storage quota!)

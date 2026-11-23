@@ -1,0 +1,6 @@
+# --- zotero-setup ---
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+CLAUDE.local.md

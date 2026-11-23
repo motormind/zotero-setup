@@ -1,0 +1,33 @@
+# --- secrets / local config: NEVER commit ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# --- AI assistant tooling (local, may contain personal data) ---
+.claude/
+CLAUDE.local.md
+.claude.json
+claude_desktop_config.json
+.mcp.local.json
+.cursor/
+.continue/
+
+# --- Zotero exports / local data ---
+*.sqlite
+zotero-cache/
+exports/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
