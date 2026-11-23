@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from importlib import resources
 from pathlib import Path
@@ -27,17 +28,46 @@ def client(cfg: Config, need_key: bool = True) -> Zotero:
     return Zotero(cfg.prefix, cfg.api_key, cfg.local, base=None if cfg.local else base)
 
 
+def _inside(root: Path, p: Path) -> bool:
+    """True if p (after resolving symlinks and ..) lives inside the project root."""
+    return p.resolve().is_relative_to(root.resolve())
+
+
 def _resolve_globs(root: Path, patterns: list[str]) -> list[Path]:
+    """Expand globs from .zotero.toml. Files outside the project (.., absolute paths,
+    symlinks pointing elsewhere) are never read or uploaded."""
     out: list[Path] = []
     for pat in patterns:
-        out.extend(sorted(p for p in root.glob(pat) if p.is_file()))
+        if Path(pat).is_absolute() or ".." in Path(pat).parts:
+            raise ConfigError(f"path {pat!r} in {CONFIG_NAME} must be relative and inside the project")
+        for p in sorted(root.glob(pat)):
+            if not p.is_file():
+                continue
+            if not _inside(root, p):
+                print(f"  ignored {p.relative_to(root)}: points outside the project", file=sys.stderr)
+                continue
+            out.append(p)
     return out
+
+
+def _safe(text: str) -> str:
+    """Strip control characters (e.g. terminal escape sequences) from remote text before printing."""
+    return "".join(ch for ch in str(text) if ch.isprintable())
+
+
+def _rel(root: Path, p: Path) -> str:
+    try:
+        return str(p.relative_to(root))
+    except ValueError:
+        return str(p)
 
 
 # ------------------------------------------------------------------------- init
 def cmd_init(cfg: Config, args) -> int:
     root = cfg.root
     tpl = resources.files("zotero_setup") / "templates"
+    if args.library_id and not args.library_id.isdigit():
+        raise ConfigError("--library-id must be the numeric ID from zotero.org/groups/<ID>/...")
 
     def write(name: str, dest: str):
         target = root / dest
@@ -58,11 +88,21 @@ def cmd_init(cfg: Config, args) -> int:
     gi = root / ".gitignore"
     snippet = (tpl / "gitignore-snippet").read_text(encoding="utf-8")
     existing = gi.read_text(encoding="utf-8") if gi.exists() else ""
-    missing = [ln for ln in snippet.splitlines() if ln and not ln.startswith("#") and ln not in existing]
+    have = {ln.strip() for ln in existing.splitlines()}
+    missing = [ln for ln in snippet.splitlines() if ln and not ln.startswith("#") and ln not in have]
     if missing:
         with gi.open("a", encoding="utf-8") as fh:
-            fh.write(("\n" if existing and not existing.endswith("\n") else "") + "\n" + snippet)
+            fh.write(("\n" if existing and not existing.endswith("\n") else "")
+                     + "\n# --- zotero-setup ---\n" + "\n".join(missing) + "\n")
         print("  update .gitignore")
+    try:
+        tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", ".env"],
+                                 capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        tracked = False
+    if tracked:
+        print("\n  WARNING: .env is tracked by git! Run `git rm --cached .env`, and if it ever held a key,\n"
+              "  delete that key at https://www.zotero.org/settings/keys.", file=sys.stderr)
 
     print("\nNext steps:\n"
           "  1. cp .env.example .env   and put your ZOTERO_API_KEY there (never commit .env)\n"
@@ -120,7 +160,7 @@ def _fmt_item(d: dict) -> str:
     if len(creators) > 1:
         first += " et al."
     year = (re.search(r"\d{4}", d.get("date", "")) or [""])[0]
-    return f"{d.get('key')}  {year:4}  {first[:25]:25}  {d.get('title', '')[:90]}"
+    return _safe(f"{d.get('key')}  {year:4}  {first[:25]:25}  {d.get('title', '')[:90]}")
 
 
 def cmd_search(cfg: Config, args) -> int:
@@ -137,30 +177,74 @@ def cmd_search(cfg: Config, args) -> int:
     return 0
 
 
+def _merge_csljson(pages: list[bytes]) -> str:
+    """Each page is its own JSON document -> merge into one array (what pandoc/Quarto expect)."""
+    items: list = []
+    for page in pages:
+        doc = json.loads(page or b"[]")
+        items.extend(doc.get("items", []) if isinstance(doc, dict) else doc)
+    return json.dumps(items, indent=2, ensure_ascii=False) + "\n"
+
+
+def _unique_citekeys(text: str) -> tuple[str, list[str]]:
+    """Zotero numbers clashing citekeys per request only, so keys can repeat across pages
+    (> 100 items). Make them unique again by appending -2, -3, ..."""
+    seen: dict[str, int] = {}
+    renamed: list[str] = []
+
+    def fix(m: re.Match) -> str:
+        key = m.group(2)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] == 1:
+            return m.group(0)
+        new = f"{key}-{seen[key]}"
+        while new in seen:
+            seen[key] += 1
+            new = f"{key}-{seen[key]}"
+        seen[new] = 1
+        renamed.append(f"{key} -> {new}")
+        return f"{m.group(1)}{new},"
+
+    return re.sub(r"^(@\w+\{)([^,\s]+),", fix, text, flags=re.M), renamed
+
+
 def cmd_pull(cfg: Config, args) -> int:
     z = client(cfg, need_key=not cfg.local)
     fmt = args.format or cfg.bib_format
-    out = Path(args.output or cfg.bib_output)
-    if not out.is_absolute():
-        out = cfg.root / out
+    if args.output:                      # explicit on the command line: any location
+        out = Path(args.output).resolve()
+    else:                                # from .zotero.toml: must stay inside the project
+        out = cfg.root / cfg.bib_output
+        if Path(cfg.bib_output).is_absolute() or not _inside(cfg.root, out):
+            raise ConfigError(f"[pull] output {cfg.bib_output!r} in {CONFIG_NAME} must be inside the project "
+                              "(use `zt pull -o <path>` to write elsewhere)")
     if not cfg.collection:
         print("note: no collection configured -> exporting the whole library", file=sys.stderr)
-    text = z.export(fmt, cfg.collection)
-    comment = "%" if fmt in {"bibtex", "biblatex"} else None
-    if comment:
+    is_bib = fmt in {"bibtex", "biblatex"}
+    if fmt == "csljson":
+        path = f"collections/{cfg.collection}/items/top" if cfg.collection else "items/top"
+        text = _merge_csljson(list(z.paginate(
+            path, {"format": fmt, "sort": "dateAdded", "direction": "asc", "limit": 100})))
+    else:
+        text = z.export(fmt, cfg.collection)
+    if is_bib:
+        text, renamed = _unique_citekeys(text)
+        if renamed:
+            print(f"note: {len(renamed)} duplicate citekey(s) renamed: {_safe(', '.join(renamed[:5]))}"
+                  + (" ..." if len(renamed) > 5 else ""), file=sys.stderr)
         src = f"collection {cfg.collection}" if cfg.collection else "library"
-        text = f"{comment} Generated by `zt pull` from Zotero {cfg.prefix} ({src}). Do not edit by hand.\n\n" + text
+        text = f"% Generated by `zt pull` from Zotero {cfg.prefix} ({src}). Do not edit by hand.\n\n" + text
     if args.stdout:
         sys.stdout.write(text)
         return 0
     old = out.read_text(encoding="utf-8") if out.exists() else None
     if old == text:
-        print(f"{out.relative_to(cfg.root)} is up to date")
+        print(f"{_rel(cfg.root, out)} is up to date")
         return 0
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
-    n = len(re.findall(r"^@", text, re.M)) if comment else "?"
-    print(f"wrote {out.relative_to(cfg.root)} ({n} entries, format {fmt})")
+    n = len(re.findall(r"^@", text, re.M)) if is_bib else "?"
+    print(f"wrote {_rel(cfg.root, out)} ({n} entries, format {fmt})")
     return 0
 
 
@@ -172,7 +256,8 @@ def _slug(s: str) -> str:
 def _pdf_keys(c: Candidate | dict) -> set[str]:
     """Filename stems a PDF may have to be matched to this item."""
     ids = c if isinstance(c, dict) else {"doi": c.doi, "arxiv": c.arxiv, "citekey": c.citekey}
-    return {_slug(v) for k, v in ids.items() if v and k in {"doi", "arxiv", "citekey"}}
+    keys = {_slug(v) for k, v in ids.items() if v and k in {"doi", "arxiv", "citekey"}}
+    return keys | (set() if isinstance(c, dict) else set(c.pdfs))
 
 
 def collect_candidates(cfg: Config, extra_ids: list[str], verbose: bool) -> list[Candidate]:
@@ -199,7 +284,7 @@ def collect_candidates(cfg: Config, extra_ids: list[str], verbose: bool) -> list
         except Exception as e:  # network / lookup errors are reported per item
             c.error = f"lookup failed for {ident}: {e}"
         if verbose and c.item:
-            print(f"  resolved {ident} -> {c.item.get('title', '')[:70]}")
+            print(f"  resolved {ident} -> {_safe(c.item.get('title', ''))[:70]}")
         cands.append(c)
 
     for f in _resolve_globs(cfg.root, cfg.bib_files):
@@ -222,14 +307,19 @@ def library_index(z: Zotero) -> tuple[dict[tuple[str, str], dict], list[dict]]:
     return idx, items
 
 
-def find_existing(idx, c: Candidate) -> dict | None:
-    probes = [("doi", c.doi.lower()), ("arxiv", c.arxiv), ("citekey", c.citekey)]
+def _identity(c: Candidate) -> list[tuple[str, str]]:
+    ids = [("doi", c.doi.lower()), ("arxiv", c.arxiv), ("citekey", c.citekey)]
     if c.item:
-        probes.append(("title", norm_title(c.item.get("title", ""))))
-    for k, v in probes:
-        if v and (k, v) in idx:
-            return idx[(k, v)]
-    return None
+        ids.append(("title", norm_title(c.item.get("title", ""))))
+    return [(k, v) for k, v in ids if v]
+
+
+def find_existing(idx, c: Candidate) -> tuple[dict | None, str]:
+    """Return (existing item, kind of match). A title-only match is the weakest kind."""
+    for k, v in _identity(c):
+        if (k, v) in idx:
+            return idx[(k, v)], k
+    return None, ""
 
 
 def cmd_push(cfg: Config, args) -> int:
@@ -244,40 +334,60 @@ def cmd_push(cfg: Config, args) -> int:
         cfg.upload_pdfs or args.pdfs) else []
 
     print("reading library index ...")
-    idx, _ = library_index(z)
+    idx, lib_items = library_index(z)
 
     failures = 0
     to_create: list[tuple[Candidate, dict]] = []
-    seen: set[str] = set()
+    seen: dict[tuple[str, str], Candidate] = {}
     pdf_targets: dict[str, str] = {}  # pdf slug -> zotero item key
     for c in cands:
         if c.error:
             print(f"  ERROR  {c.source}: {c.error}")
             failures += 1
             continue
-        existing = find_existing(idx, c)
+        existing, how = find_existing(idx, c)
         if existing:
+            if how == "title":  # weakest match -> always show it so a wrong guess is noticed
+                print(f"  SAME?  {c.source}: same title as {existing['key']} "
+                      f"\"{_safe(existing['data'].get('title', ''))[:60]}\" -> treated as existing")
             for s in _pdf_keys(c):
                 pdf_targets[s] = existing["key"]
             cols = existing["data"].get("collections", [])
             if cfg.collection and cfg.collection not in cols:
                 print(f"  LINK   {c.source}: exists ({existing['key']}) -> add to collection")
                 if not dry:
-                    z.request("PATCH", f"items/{existing['key']}",
-                              body=json.dumps({"collections": cols + [cfg.collection]}).encode(),
-                              headers={"Content-Type": "application/json",
-                                       "If-Unmodified-Since-Version": str(existing["version"])})
+                    try:
+                        z.request("PATCH", f"items/{existing['key']}",
+                                  body=json.dumps({"collections": cols + [cfg.collection]}).encode(),
+                                  headers={"Content-Type": "application/json",
+                                           "If-Unmodified-Since-Version": str(existing["version"])})
+                        cols.append(cfg.collection)  # the same item may come up again in this run
+                    except ZoteroError as e:
+                        print(f"  FAILED {c.source}: {e}")
+                        failures += 1
             elif args.verbose:
                 print(f"  skip   {c.source}: already in Zotero ({existing['key']})")
             continue
-        dedup_key = c.doi.lower() or c.arxiv or norm_title(c.item.get("title", ""))
-        if dedup_key in seen:
+        ident = _identity(c)
+        if not ident:
+            print(f"  ERROR  {c.source}: entry has neither a title nor an identifier")
+            failures += 1
             continue
-        seen.add(dedup_key)
-        item = fit_to_template(c.item, z.template(c.item["itemType"]), tags, cfg.collection)
+        first = next((seen[i] for i in ident if i in seen), None)
+        if first is not None:  # same paper listed twice (e.g. in ids.txt and in a .bib)
+            first.pdfs.extend(_pdf_keys(c))  # its PDF names still lead to the one item
+            continue
+        seen.update((i, c) for i in ident)
+        try:
+            item = fit_to_template(c.item, z.template(c.item["itemType"]), tags, cfg.collection)
+        except ZoteroError as e:
+            print(f"  ERROR  {c.source}: item type {c.item['itemType']!r} not accepted: {e}")
+            failures += 1
+            continue
         to_create.append((c, item))
-        print(f"  NEW    {c.source}: [{item['itemType']}] {item.get('title', '')[:80]}")
+        print(f"  NEW    {c.source}: [{item['itemType']}] {_safe(item.get('title', ''))[:80]}")
 
+    created = len(to_create)
     if dry:
         for c, _ in to_create:
             for s in _pdf_keys(c):
@@ -288,6 +398,7 @@ def cmd_push(cfg: Config, args) -> int:
             if err:
                 print(f"  FAILED {c.source}: {err}")
                 failures += 1
+                created -= 1
             else:
                 for s in _pdf_keys(c):
                     pdf_targets[s] = key
@@ -299,6 +410,8 @@ def cmd_push(cfg: Config, args) -> int:
                 pdf_targets.setdefault(_slug(v), it["key"])
         child_cache: dict[str, set[str]] = {}
         existing_keys = {it["key"] for it in idx.values()}
+        standalone = {it["data"].get("filename") for it in lib_items
+                      if it["data"].get("itemType") == "attachment"}
         for pdf in pdfs:
             rel = pdf.relative_to(cfg.root)
             parent = pdf_targets.get(_slug(pdf.stem))
@@ -316,6 +429,10 @@ def cmd_push(cfg: Config, args) -> int:
                         print(f"  skip   {rel}: already attached to {parent}")
                     continue
                 child_cache[parent].add(pdf.name)
+            elif pdf.name in standalone:
+                if args.verbose:
+                    print(f"  skip   {rel}: already in Zotero as standalone attachment")
+                continue
             print(f"  PDF    {rel} -> {parent or '(standalone)'}")
             if not dry:
                 try:
@@ -324,7 +441,6 @@ def cmd_push(cfg: Config, args) -> int:
                     print(f"  FAILED {rel}: {e}")
                     failures += 1
 
-    created = len(to_create)
     print(f"\n{'[dry-run] would create' if dry else 'created'} {created} item(s); {failures} error(s).")
     if dry and created:
         print("Run again without --dry-run to write to Zotero.")

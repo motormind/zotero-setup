@@ -39,9 +39,33 @@ HINTS = {
 }
 
 
+def _origin(url: str) -> tuple[str, str]:
+    u = urllib.parse.urlsplit(url)
+    return u.scheme.lower(), u.netloc.lower()
+
+
+class _StripKeyOnRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward the API key to another origin when following a redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _origin(newurl) != _origin(req.full_url):
+            for store in (new.headers, new.unredirected_hdrs):
+                for k in [k for k in store if k.lower() in {"zotero-api-key", "authorization"}]:
+                    del store[k]
+        return new
+
+
+_opener = urllib.request.build_opener(_StripKeyOnRedirect)
+
+
 class Zotero:
     def __init__(self, prefix: str, api_key: str = "", local: bool = False, base: str | None = None):
         self.base = base or (LOCAL_BASE if local else WEB_BASE)
+        scheme, netloc = _origin(self.base)
+        host = netloc.rsplit(":", 1)[0]
+        if api_key and scheme != "https" and host not in {"localhost", "127.0.0.1", "[::1]"}:
+            raise ZoteroError(0, f"refusing to send the API key over unencrypted {scheme}:// to {host}")
         self.prefix = prefix
         self._key = api_key
         self.local = local
@@ -73,7 +97,8 @@ class Zotero:
     ) -> tuple[int, dict, bytes]:
         url = self._url(path, params)
         h = {"Zotero-API-Version": "3", "User-Agent": USER_AGENT}
-        if auth and self._key and url.startswith(self.base):
+        # the key is only ever sent to the API origin itself (exact scheme+host match)
+        if auth and self._key and _origin(url) == _origin(self.base):
             h["Zotero-API-Key"] = self._key
         h.update(headers or {})
 
@@ -81,7 +106,7 @@ class Zotero:
         for attempt in range(retries + 1):
             req = urllib.request.Request(url, data=body, method=method, headers=h)
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
+                with _opener.open(req, timeout=60) as resp:
                     status, rh, data = resp.status, dict(resp.headers), resp.read()
             except urllib.error.HTTPError as e:
                 status, rh, data = e.code, dict(e.headers or {}), e.read()
@@ -205,11 +230,25 @@ class Zotero:
         else:
             att.pop("parentItem", None)
             att["collections"] = [collection] if collection else []
+        content = path.read_bytes()
+        if not content.startswith(b"%PDF"):
+            raise ZoteroError(0, f"{path.name} is not a PDF file (missing %PDF header)")
         [(_, key, err)] = self.create_items([att])
         if err or not key:
             raise ZoteroError(400, f"creating attachment failed: {err}")
+        try:
+            self._upload_file(key, path, content)
+        except Exception:
+            # do not leave an attachment item without a file behind
+            try:
+                version = self.get_json(f"items/{key}")["version"]
+                self.request("DELETE", f"items/{key}", headers={"If-Unmodified-Since-Version": str(version)})
+            except Exception:
+                print(f"  warning: could not remove incomplete attachment {key}", file=sys.stderr)
+            raise
+        return key
 
-        content = path.read_bytes()
+    def _upload_file(self, key: str, path: Path, content: bytes) -> None:
         form = urllib.parse.urlencode({
             "md5": hashlib.md5(content).hexdigest(),
             "filename": path.name,
@@ -220,7 +259,7 @@ class Zotero:
         _, _, data = self.request("POST", f"items/{key}/file", body=form, headers=form_h)
         auth = json.loads(data)
         if auth.get("exists"):
-            return key
+            return
         # upload to storage (not api.zotero.org -> no API key sent)
         self.request(
             "POST", auth["url"],
@@ -231,4 +270,3 @@ class Zotero:
             "POST", f"items/{key}/file",
             body=urllib.parse.urlencode({"upload": auth["uploadKey"]}).encode(), headers=form_h,
         )
-        return key

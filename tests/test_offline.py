@@ -101,3 +101,53 @@ class TestConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHardening(unittest.TestCase):
+    def test_paren_in_abstract_does_not_end_entry(self):
+        e = parse_bibtex("@article{k, abstract={a) one b) two}, title={T}, year={2020}, month=jun}")[0]
+        self.assertEqual(e["title"], "T")
+        self.assertEqual(from_bibtex_entry(e)["date"], "2020-06")
+
+    def test_dotenv_cannot_redirect_api(self):
+        from zotero_setup.config import load_dotenv
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, ".env").write_text("ZOTERO_API_URL=https://evil.example\nZOTERO_LOCAL=true # note\n")
+            for k in ("ZOTERO_API_URL", "ZOTERO_LOCAL"):
+                os.environ.pop(k, None)
+            try:
+                load_dotenv(Path(d, ".env"))
+                self.assertNotIn("ZOTERO_API_URL", os.environ)
+                self.assertEqual(os.environ["ZOTERO_LOCAL"], "true")
+            finally:
+                os.environ.pop("ZOTERO_LOCAL", None)
+
+    def test_invalid_ids_rejected(self):
+        from zotero_setup.config import Config
+        with self.assertRaises(ConfigError):
+            Config(root=Path("."), library_id="1/../../keys").require_library()
+        with self.assertRaises(ConfigError):
+            Config(root=Path("."), library_id="1", collection="../x").require_library()
+
+    def test_key_only_goes_to_api_origin(self):
+        from zotero_setup.api import Zotero, ZoteroError, _origin
+        self.assertNotEqual(_origin("https://api.zotero.org.evil.example/x"), _origin("https://api.zotero.org"))
+        with self.assertRaises(ZoteroError):
+            Zotero("/groups/1", "k" * 24, base="http://example.org")
+
+    def test_files_outside_project_are_ignored(self):
+        from zotero_setup.cli import _resolve_globs
+        with tempfile.TemporaryDirectory() as d, tempfile.NamedTemporaryFile(suffix=".pdf") as outside:
+            root = Path(d)
+            (root / "papers").mkdir()
+            (root / "papers" / "ok.pdf").write_bytes(b"%PDF")
+            (root / "papers" / "link.pdf").symlink_to(outside.name)
+            self.assertEqual([p.name for p in _resolve_globs(root, ["papers/*.pdf"])], ["ok.pdf"])
+            with self.assertRaises(ConfigError):
+                _resolve_globs(root, ["../*.pdf"])
+
+    def test_unique_citekeys(self):
+        from zotero_setup.cli import _unique_citekeys
+        text, renamed = _unique_citekeys("@article{a,\n}\n@book{a,\n}\n@misc{b,\n}\n")
+        self.assertIn("@book{a-2,", text)
+        self.assertEqual(renamed, ["a -> a-2"])

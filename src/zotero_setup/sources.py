@@ -10,6 +10,7 @@ import html
 import json
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -65,8 +66,10 @@ def parse_identifier(line: str) -> tuple[str, str]:
 def read_ids_file(path) -> list[tuple[str, str, str]]:
     """Lines of DOIs / arXiv IDs / URLs. '#' starts a comment. Returns (kind, id, source)."""
     out = []
-    for n, raw in enumerate(open(path, encoding="utf-8"), 1):
-        line = raw.split("#", 1)[0].strip()
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    for n, raw in enumerate(lines, 1):
+        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()  # '#' inside a URL is kept
         if not line:
             continue
         kind, ident = parse_identifier(line)
@@ -99,8 +102,66 @@ def _strip_jats(s: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
 
 
+CSL_TYPES = {
+    "article-journal": ("journalArticle", "publicationTitle"),
+    "paper-conference": ("conferencePaper", "proceedingsTitle"),
+    "chapter": ("bookSection", "bookTitle"),
+    "book": ("book", None),
+    "article": ("preprint", None),
+    "report": ("report", None),
+    "thesis": ("thesis", None),
+    "dataset": ("dataset", None),
+    "software": ("computerProgram", None),
+}
+
+
+def from_doi_csl(doi: str) -> dict:
+    """Any DOI registrar (DataCite: Zenodo, figshare, ...) via doi.org content negotiation."""
+    msg = json.loads(_get("https://doi.org/" + urllib.parse.quote(doi),
+                          accept="application/vnd.citationstyles.csl+json"))
+    item_type, container_field = CSL_TYPES.get(msg.get("type", ""), ("document", None))
+    ctype = "programmer" if item_type == "computerProgram" else "author"
+    creators = []
+    for a in msg.get("author", []):
+        if a.get("family"):
+            creators.append({"creatorType": ctype, "lastName": a["family"], "firstName": a.get("given", "")})
+        elif a.get("literal") or a.get("name"):
+            creators.append({"creatorType": ctype, "name": a.get("literal") or a["name"]})
+    parts = ((msg.get("issued") or {}).get("date-parts") or [[]])[0]
+    title = msg.get("title") or ""
+    publisher = msg.get("publisher", "")
+    item = {
+        "itemType": item_type,
+        "title": " ".join(title) if isinstance(title, list) else title,
+        "creators": creators,
+        "date": "-".join(f"{int(p):02d}" if i else str(p) for i, p in enumerate(parts) if p),
+        "DOI": msg.get("DOI", doi),
+        "url": msg.get("URL", f"https://doi.org/{doi}"),
+        "volume": str(msg.get("volume", "")),
+        "issue": str(msg.get("issue", "")),
+        "pages": msg.get("page", ""),
+        "publisher": publisher,
+        "company": publisher,
+        "repository": publisher,
+        "versionNumber": str(msg.get("version", "")),
+        "abstractNote": _strip_jats(msg.get("abstract", "")),
+        "language": msg.get("language", ""),
+        "_extra": [f"DOI: {msg.get('DOI', doi)}"],
+    }
+    container = msg.get("container-title") or ""
+    if container_field and container:
+        item[container_field] = container if isinstance(container, str) else container[0]
+    return item
+
+
 def from_doi(doi: str) -> dict:
-    msg = json.loads(_get("https://api.crossref.org/works/" + urllib.parse.quote(doi)))["message"]
+    try:
+        raw = _get("https://api.crossref.org/works/" + urllib.parse.quote(doi))
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        return from_doi_csl(doi)  # not a Crossref DOI
+    msg = json.loads(raw)["message"]
     item_type, container_field = CROSSREF_TYPES.get(msg.get("type", ""), ("journalArticle", "publicationTitle"))
     creators = []
     for role, ctype in (("author", "author"), ("editor", "editor")):
@@ -221,11 +282,13 @@ def parse_bibtex(text: str) -> list[dict]:
             continue
         etype = m.group(1).lower()
         j = at + m.end()
+        # only count the delimiter that opened the entry: "a) ..." in an abstract must not close it
+        opener, closer = ("{", "}") if m.group(2) == "{" else ("(", ")")
         depth, k = 1, j
         while k < n and depth:
-            if text[k] in "{(":
+            if text[k] == opener:
                 depth += 1
-            elif text[k] in "})":
+            elif text[k] == closer:
                 depth -= 1
             k += 1
         body, i = text[j:k - 1], k
@@ -280,6 +343,16 @@ def _bib_creators(value: str, ctype: str) -> list[dict]:
     return out
 
 
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+
+
+def _month(m: str) -> str:
+    m = m.strip().lower()
+    if m.isdigit() and 1 <= int(m) <= 12:
+        return f"{int(m):02d}"
+    return f"{MONTHS.index(m[:3]) + 1:02d}" if m[:3] in MONTHS else ""
+
+
 def from_bibtex_entry(e: dict) -> dict:
     etype = e["_type"]
     item_type, container_field = BIB_TYPES.get(etype, ("document", None))
@@ -293,7 +366,7 @@ def from_bibtex_entry(e: dict) -> dict:
         "itemType": item_type,
         "title": c("title"),
         "creators": _bib_creators(e.get("author", ""), "author") + _bib_creators(e.get("editor", ""), "editor"),
-        "date": c("date") or "-".join(x for x in (c("year"), c("month")) if x),
+        "date": c("date") or "-".join(x for x in (c("year"), _month(c("month"))) if x),
         "volume": c("volume"),
         "issue": c("number") or c("issue"),
         "pages": c("pages").replace("–", "-"),

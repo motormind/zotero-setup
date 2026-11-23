@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 CONFIG_NAME = ".zotero.toml"
+
+# Only these variables are read from a project's .env. Anything else (in particular
+# ZOTERO_API_URL, which decides where the key is sent) must come from the real environment,
+# so a .env committed to a cloned repo cannot redirect your key.
+DOTENV_KEYS = {
+    "ZOTERO_API_KEY", "ZOTERO_LIBRARY_ID", "ZOTERO_LIBRARY_TYPE", "ZOTERO_COLLECTION",
+    "ZOTERO_LOCAL", "CROSSREF_MAILTO",
+}
 
 
 class ConfigError(Exception):
@@ -40,7 +49,10 @@ def load_dotenv(path: Path) -> None:
         key, value = key.strip(), value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        os.environ.setdefault(key, value)
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()  # inline comment
+        if key in DOTENV_KEYS:
+            os.environ.setdefault(key, value)
 
 
 def _truthy(v: str | None) -> bool:
@@ -78,6 +90,11 @@ class Config:
             raise ConfigError(
                 "No library configured. Set library_id in .zotero.toml or ZOTERO_LIBRARY_ID."
             )
+        if self.library_id and not self.library_id.isdigit():
+            raise ConfigError(f"library_id must be numeric, got {self.library_id!r}")
+        if self.collection and not re.fullmatch(r"[A-Za-z0-9]{8}", self.collection):
+            raise ConfigError(f"collection must be an 8-character key (see `zt collections`), "
+                              f"got {self.collection!r}")
 
     def require_key(self) -> None:
         if not self.local and not self.api_key:
